@@ -1,0 +1,596 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Login-protected Lambda Function URL for starting, stopping, and automatically
+  stopping one Satisfactory EC2 instance.
+
+Parameters:
+  InstanceId:
+    Type: String
+    Description: EC2 instance ID for the Satisfactory server, in this same AWS Region.
+    AllowedPattern: '^i-[0-9a-fA-F]+$'
+
+  BasicAuthUsername:
+    Type: String
+    Default: satisfactory
+    MinLength: 1
+    MaxLength: 64
+    Description: Username used to open the control page.
+
+  BasicAuthPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    MaxLength: 128
+    Description: Use a long, unique password. It is stored in an encrypted Lambda environment variable.
+
+  AutoStopHours:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 24
+    Description: Hours after pressing Start before the EC2 instance is stopped.
+
+  ExtendHours:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 12
+    Description: Hours added by the Extend button.
+
+Resources:
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub 'satisfactory-${AWS::StackName}'
+
+  SchedulerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'satisfactory-scheduler-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule-group/satisfactory-${AWS::StackName}'
+      Policies:
+        - PolicyName: InvokeControlLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:satisfactory-control-${AWS::StackName}'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'satisfactory-lambda-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ControlOnlyThisInstance
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadInstanceState
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+              - Sid: ControlInstance
+                Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${InstanceId}'
+              - Sid: ManageAutoStopSchedule
+                Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:GetSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                Resource: !Sub 'arn:${AWS::Partition}:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/satisfactory-${AWS::StackName}/satisfactory-stop-${InstanceId}'
+              - Sid: PassSchedulerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/satisfactory-scheduler-${AWS::StackName}'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
+
+  ControlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - SchedulerExecutionRole
+      - ScheduleGroup
+    Properties:
+      FunctionName: !Sub 'satisfactory-control-${AWS::StackName}'
+      Description: Login-protected web page for controlling a Satisfactory EC2 server.
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      MemorySize: 128
+      Timeout: 15
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref InstanceId
+          BASIC_AUTH_USER: !Ref BasicAuthUsername
+          BASIC_AUTH_PASS: !Ref BasicAuthPassword
+          AUTO_STOP_HOURS: !Ref AutoStopHours
+          EXTEND_HOURS: !Ref ExtendHours
+          SCHEDULE_GROUP: !Ref ScheduleGroup
+          SCHEDULER_ROLE_ARN: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/satisfactory-scheduler-${AWS::StackName}'
+      Code:
+        ZipFile: |
+          import base64
+          import boto3
+          import datetime as dt
+          import hashlib
+          import hmac
+          import html
+          import json
+          import os
+          import socket
+          from urllib.parse import parse_qs
+
+          INSTANCE_ID = os.environ["INSTANCE_ID"]
+          AUTH_USER = os.environ["BASIC_AUTH_USER"]
+          AUTH_PASS = os.environ["BASIC_AUTH_PASS"]
+          AUTO_STOP_HOURS = int(os.environ.get("AUTO_STOP_HOURS", "4"))
+          EXTEND_HOURS = int(os.environ.get("EXTEND_HOURS", "2"))
+          SCHEDULE_GROUP = os.environ["SCHEDULE_GROUP"]
+          SCHEDULER_ROLE_ARN = os.environ["SCHEDULER_ROLE_ARN"]
+          SCHEDULE_NAME = f"satisfactory-stop-{INSTANCE_ID}"
+          AUTO_STOP_TAG = "SatisfactoryAutoStopAt"
+
+          ec2 = boto3.client("ec2")
+          scheduler = boto3.client("scheduler")
+
+
+          def response(status_code, body, extra_headers=None, cookies=None):
+              headers = {
+                  "content-type": "text/html; charset=utf-8",
+                  "cache-control": "no-store, max-age=0",
+                  "pragma": "no-cache",
+                  "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                  "x-content-type-options": "nosniff",
+                  "x-frame-options": "DENY",
+                  "referrer-policy": "no-referrer",
+              }
+              if extra_headers:
+                  headers.update(extra_headers)
+              result = {"statusCode": status_code, "headers": headers, "body": body}
+              if cookies:
+                  result["cookies"] = cookies
+              return result
+
+
+          def normalize_headers(event):
+              return {str(k).lower(): str(v) for k, v in (event.get("headers") or {}).items()}
+
+
+          AUTH_COOKIE_NAME = "satisfactory_control_auth"
+
+
+          def auth_cookie_value():
+              payload = f"{AUTH_USER}:satisfactory-control-auth-v1".encode("utf-8")
+              return hmac.new(AUTH_PASS.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+          def cookie_value(event, name):
+              raw_cookie = normalize_headers(event).get("cookie", "")
+              for part in raw_cookie.split(";"):
+                  key, separator, value = part.strip().partition("=")
+                  if separator and key == name:
+                      return value
+              return ""
+
+
+          def authorized(event):
+              # Continue accepting HTTP Basic credentials for curl or password managers.
+              supplied = normalize_headers(event).get("authorization", "")
+              raw = f"{AUTH_USER}:{AUTH_PASS}".encode("utf-8")
+              expected_basic = "Basic " + base64.b64encode(raw).decode("ascii")
+              if hmac.compare_digest(supplied, expected_basic):
+                  return True
+
+              supplied_cookie = cookie_value(event, AUTH_COOKIE_NAME)
+              return hmac.compare_digest(supplied_cookie, auth_cookie_value())
+
+
+          def csrf_token():
+              return hmac.new(
+                  AUTH_PASS.encode("utf-8"),
+                  b"satisfactory-control-csrf-v1",
+                  hashlib.sha256,
+              ).hexdigest()
+
+
+          def parse_form(event):
+              raw = event.get("body") or ""
+              if event.get("isBase64Encoded"):
+                  raw = base64.b64decode(raw).decode("utf-8")
+              values = parse_qs(raw, keep_blank_values=True)
+              return {key: value[-1] for key, value in values.items()}
+
+
+          def describe_instance():
+              result = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+              instance = result["Reservations"][0]["Instances"][0]
+              tags = {tag["Key"]: tag["Value"] for tag in instance.get("Tags", [])}
+              return {
+                  "state": instance["State"]["Name"],
+                  "public_ip": instance.get("PublicIpAddress", ""),
+                  "private_ip": instance.get("PrivateIpAddress", ""),
+                  "instance_type": instance.get("InstanceType", ""),
+                  "launch_time": instance.get("LaunchTime"),
+                  "auto_stop_at": tags.get(AUTO_STOP_TAG, ""),
+              }
+
+
+          def game_port_is_open(public_ip):
+              if not public_ip:
+                  return False
+              try:
+                  with socket.create_connection((public_ip, 7777), timeout=1.25):
+                      return True
+              except OSError:
+                  return False
+
+
+          def set_auto_stop_tag(when_utc):
+              value = when_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+              ec2.create_tags(
+                  Resources=[INSTANCE_ID],
+                  Tags=[{"Key": AUTO_STOP_TAG, "Value": value}],
+              )
+              return value
+
+
+          def clear_auto_stop_tag():
+              ec2.delete_tags(Resources=[INSTANCE_ID], Tags=[{"Key": AUTO_STOP_TAG}])
+
+
+          def schedule_auto_stop(when_utc, function_arn):
+              stop_at = set_auto_stop_tag(when_utc)
+              schedule_time = when_utc.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%S")
+              payload = json.dumps({
+                  "action": "scheduled-stop",
+                  "instance_id": INSTANCE_ID,
+                  "expected_stop_at": stop_at,
+              })
+              arguments = {
+                  "Name": SCHEDULE_NAME,
+                  "GroupName": SCHEDULE_GROUP,
+                  "ScheduleExpression": f"at({schedule_time})",
+                  "ScheduleExpressionTimezone": "UTC",
+                  "FlexibleTimeWindow": {"Mode": "OFF"},
+                  "ActionAfterCompletion": "DELETE",
+                  "State": "ENABLED",
+                  "Target": {
+                      "Arn": function_arn,
+                      "RoleArn": SCHEDULER_ROLE_ARN,
+                      "Input": payload,
+                      "RetryPolicy": {
+                          "MaximumEventAgeInSeconds": 3600,
+                          "MaximumRetryAttempts": 2,
+                      },
+                  },
+              }
+              try:
+                  scheduler.get_schedule(Name=SCHEDULE_NAME, GroupName=SCHEDULE_GROUP)
+                  scheduler.update_schedule(**arguments)
+              except scheduler.exceptions.ResourceNotFoundException:
+                  scheduler.create_schedule(**arguments)
+              return stop_at
+
+
+          def delete_schedule():
+              try:
+                  scheduler.delete_schedule(Name=SCHEDULE_NAME, GroupName=SCHEDULE_GROUP)
+              except scheduler.exceptions.ResourceNotFoundException:
+                  pass
+
+
+          def scheduled_stop(event):
+              if event.get("instance_id") != INSTANCE_ID:
+                  return {"ok": False, "reason": "wrong instance"}
+
+              expected = event.get("expected_stop_at", "")
+              current = describe_instance()
+              if not expected or current.get("auto_stop_at") != expected:
+                  return {"ok": True, "ignored": True, "reason": "timer was replaced or canceled"}
+
+              if current["state"] in ("running", "pending"):
+                  ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+              clear_auto_stop_tag()
+              return {"ok": True, "stopping": current["state"] in ("running", "pending")}
+
+
+          def perform_action(action, context):
+              now = dt.datetime.now(dt.timezone.utc)
+              current = describe_instance()
+
+              if action == "start":
+                  if current["state"] == "stopped":
+                      ec2.start_instances(InstanceIds=[INSTANCE_ID])
+                      message = "Start requested. The game normally needs a few minutes to become ready."
+                  elif current["state"] == "running":
+                      message = "The instance was already running. The shutdown timer was reset."
+                  elif current["state"] == "pending":
+                      message = "The instance is already starting. The shutdown timer was reset."
+                  else:
+                      return f"Cannot start while the instance is {current['state']}."
+
+                  deadline = now + dt.timedelta(hours=AUTO_STOP_HOURS)
+                  schedule_auto_stop(deadline, context.invoked_function_arn)
+                  return message
+
+              if action == "extend":
+                  if current["state"] not in ("running", "pending"):
+                      return "The server must be running or starting before its timer can be extended."
+
+                  base = now
+                  existing = current.get("auto_stop_at", "")
+                  if existing:
+                      try:
+                          parsed = dt.datetime.fromisoformat(existing.replace("Z", "+00:00"))
+                          if parsed > base:
+                              base = parsed
+                      except ValueError:
+                          pass
+                  deadline = base + dt.timedelta(hours=EXTEND_HOURS)
+                  schedule_auto_stop(deadline, context.invoked_function_arn)
+                  return f"Shutdown extended by {EXTEND_HOURS} hour(s)."
+
+              if action == "stop":
+                  delete_schedule()
+                  clear_auto_stop_tag()
+                  if current["state"] == "running":
+                      ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+                      return "Stop requested. AWS will perform a normal operating-system shutdown."
+                  if current["state"] == "stopped":
+                      return "The instance is already stopped."
+                  return f"The instance is currently {current['state']}; try Stop again after it finishes changing state."
+
+              return "Unknown action."
+
+
+          def login_page(message=""):
+              escaped_message = html.escape(message)
+              return f"""<!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Satisfactory Server Login</title>
+            <style>
+              :root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
+              body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111827; color: #f9fafb; }}
+              main {{ width: min(90vw, 390px); background: #1f2937; padding: 28px; border-radius: 18px; box-shadow: 0 18px 50px #0008; }}
+              h1 {{ margin-top: 0; font-size: 1.55rem; }}
+              label {{ display: block; margin: 14px 0 6px; color: #d1d5db; }}
+              input {{ box-sizing: border-box; width: 100%; border: 1px solid #4b5563; border-radius: 9px; padding: 12px; background: #111827; color: #f9fafb; font: inherit; }}
+              button {{ width: 100%; margin-top: 20px; border: 0; border-radius: 10px; padding: 13px 16px; background: #34d399; color: #052e2b; font: inherit; font-weight: 750; cursor: pointer; }}
+              .message {{ background: #7f1d1d; padding: 10px 12px; border-radius: 9px; margin-bottom: 14px; }}
+              small {{ display: block; margin-top: 16px; color: #9ca3af; line-height: 1.4; }}
+            </style>
+          </head>
+          <body>
+            <main>
+              <h1>Satisfactory Server</h1>
+              {f'<div class="message">{escaped_message}</div>' if message else ''}
+              <form method="post">
+                <input type="hidden" name="action" value="login">
+                <label for="username">Username</label>
+                <input id="username" name="username" autocomplete="username" required autofocus>
+                <label for="password">Password</label>
+                <input id="password" name="password" type="password" autocomplete="current-password" required>
+                <button type="submit">Sign in</button>
+              </form>
+              <small>The page is protected by HTTPS. A secure, HTTP-only login cookie lasts for 12 hours.</small>
+            </main>
+          </body>
+          </html>"""
+
+
+          def render_page(message=""):
+              instance = describe_instance()
+              state = instance["state"]
+              ip = instance["public_ip"]
+              port_open = state == "running" and game_port_is_open(ip)
+
+              if state == "running" and port_open:
+                  readiness = "Game port 7777 is responding"
+                  status_class = "good"
+              elif state == "running":
+                  readiness = "EC2 is running; Satisfactory may still be starting or updating"
+                  status_class = "warn"
+              elif state == "pending":
+                  readiness = "EC2 is starting"
+                  status_class = "warn"
+              elif state == "stopped":
+                  readiness = "Server is offline"
+                  status_class = "off"
+              else:
+                  readiness = f"Instance state: {state}"
+                  status_class = "warn"
+
+              escaped_message = html.escape(message)
+              escaped_ip = html.escape(ip or "Not assigned")
+              escaped_state = html.escape(state)
+              escaped_type = html.escape(instance["instance_type"])
+              escaped_deadline = html.escape(instance["auto_stop_at"] or "Not scheduled")
+              token = csrf_token()
+              refresh_script = "<script>setTimeout(() => location.reload(), 10000);</script>" if state in ("pending", "stopping") or message.startswith("Start requested") else ""
+
+              return f"""<!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Satisfactory Server</title>
+            <style>
+              :root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
+              body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: #111827; color: #f9fafb; }}
+              main {{ width: min(92vw, 520px); background: #1f2937; padding: 28px; border-radius: 18px; box-shadow: 0 18px 50px #0008; }}
+              h1 {{ margin-top: 0; font-size: 1.7rem; }}
+              .status {{ padding: 14px; border-radius: 12px; margin: 18px 0; background: #111827; }}
+              .good {{ border-left: 5px solid #34d399; }}
+              .warn {{ border-left: 5px solid #fbbf24; }}
+              .off {{ border-left: 5px solid #9ca3af; }}
+              dl {{ display: grid; grid-template-columns: 145px 1fr; gap: 8px 12px; }}
+              dt {{ color: #9ca3af; }}
+              dd {{ margin: 0; overflow-wrap: anywhere; }}
+              .message {{ background: #0f766e; padding: 11px 13px; border-radius: 10px; margin-bottom: 16px; }}
+              .buttons {{ display: grid; gap: 10px; margin-top: 22px; }}
+              button, .refresh {{ border: 0; border-radius: 10px; padding: 13px 16px; font: inherit; font-weight: 700; cursor: pointer; text-align: center; }}
+              button[name=action][value=start] {{ background: #34d399; color: #052e2b; }}
+              button[name=action][value=extend] {{ background: #60a5fa; color: #0c2340; }}
+              button[name=action][value=stop] {{ background: #f87171; color: #450a0a; }}
+              .refresh {{ display: block; background: #374151; color: #f9fafb; text-decoration: none; }}
+              small {{ color: #9ca3af; display: block; margin-top: 18px; line-height: 1.4; }}
+            </style>
+          </head>
+          <body>
+            <main>
+              <h1>Satisfactory Server</h1>
+              {f'<div class="message">{escaped_message}</div>' if message else ''}
+              <div class="status {status_class}"><strong>{html.escape(readiness)}</strong></div>
+              <dl>
+                <dt>EC2 state</dt><dd>{escaped_state}</dd>
+                <dt>Instance type</dt><dd>{escaped_type}</dd>
+                <dt>Public address</dt><dd>{escaped_ip}{':7777' if ip else ''}</dd>
+                <dt>Auto-stop UTC</dt><dd id="deadline" data-utc="{escaped_deadline}">{escaped_deadline}</dd>
+              </dl>
+              <div class="buttons">
+                <form method="post">
+                  <input type="hidden" name="csrf" value="{token}">
+                  <button type="submit" name="action" value="start">Start server / reset {AUTO_STOP_HOURS}-hour timer</button>
+                </form>
+                <form method="post">
+                  <input type="hidden" name="csrf" value="{token}">
+                  <button type="submit" name="action" value="extend">Extend by {EXTEND_HOURS} hours</button>
+                </form>
+                <form method="post">
+                  <input type="hidden" name="csrf" value="{token}">
+                  <button type="submit" name="action" value="stop">Stop server now</button>
+                </form>
+                <a class="refresh" href="./">Refresh status</a>
+                <form method="post">
+                  <input type="hidden" name="action" value="logout">
+                  <input type="hidden" name="csrf" value="{token}">
+                  <button type="submit" style="background:#4b5563;color:#f9fafb">Sign out</button>
+                </form>
+              </div>
+              <small>Stopping uses the standard EC2 stop operation. Keep Docker's stop_grace_period configured so the game can save during shutdown.</small>
+            </main>
+            <script>
+              const el = document.getElementById('deadline');
+              if (el && el.dataset.utc && el.dataset.utc !== 'Not scheduled') {{
+                const parsed = new Date(el.dataset.utc);
+                if (!Number.isNaN(parsed.getTime())) el.textContent = parsed.toLocaleString();
+              }}
+            </script>
+            {refresh_script}
+          </body>
+          </html>"""
+
+
+          def lambda_handler(event, context):
+              # Direct invocation by EventBridge Scheduler does not have Function URL requestContext.
+              if "requestContext" not in event and event.get("action") == "scheduled-stop":
+                  return scheduled_stop(event)
+
+              method = ((event.get("requestContext") or {}).get("http") or {}).get("method", "GET").upper()
+              form = parse_form(event) if method == "POST" else {}
+
+              if method == "POST" and form.get("action") == "login":
+                  valid_user = hmac.compare_digest(form.get("username", ""), AUTH_USER)
+                  valid_pass = hmac.compare_digest(form.get("password", ""), AUTH_PASS)
+                  if valid_user and valid_pass:
+                      login_cookie = (
+                          f"{AUTH_COOKIE_NAME}={auth_cookie_value()}; "
+                          "Max-Age=43200; Path=/; Secure; HttpOnly; SameSite=Strict"
+                      )
+                      return response(303, "", {"Location": "./"}, [login_cookie])
+                  return response(401, login_page("Incorrect username or password."))
+
+              if not authorized(event):
+                  return response(200, login_page())
+
+              if method == "POST" and form.get("action") == "logout":
+                  if not hmac.compare_digest(form.get("csrf", ""), csrf_token()):
+                      return response(403, "<h1>Invalid request token</h1>")
+                  expired_cookie = (
+                      f"{AUTH_COOKIE_NAME}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict"
+                  )
+                  return response(303, "", {"Location": "./"}, [expired_cookie])
+
+              message = ""
+              if method == "POST":
+                  if not hmac.compare_digest(form.get("csrf", ""), csrf_token()):
+                      return response(403, "<h1>Invalid request token</h1>")
+                  try:
+                      message = perform_action(form.get("action", ""), context)
+                  except Exception as exc:
+                      print(f"Control action failed: {type(exc).__name__}: {exc}")
+                      message = f"AWS request failed: {type(exc).__name__}. Check the Lambda logs for details."
+
+              try:
+                  return response(200, render_page(message))
+              except Exception as exc:
+                  print(f"Page rendering failed: {type(exc).__name__}: {exc}")
+                  return response(500, "<h1>Unable to read server status</h1><p>Check the Lambda logs.</p>")
+
+  ControlFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ControlFunction.Arn
+      AuthType: NONE
+      InvokeMode: BUFFERED
+
+  PublicFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ControlFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: '*'
+      FunctionUrlAuthType: NONE
+
+  PublicFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ControlFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
+
+Outputs:
+  ControlPageUrl:
+    Description: Open this URL and sign in with the username and password supplied to the stack.
+    Value: !GetAtt ControlFunctionUrl.FunctionUrl
+
+  LambdaFunctionName:
+    Value: !Ref ControlFunction
+
+  ScheduleGroupName:
+    Value: !Ref ScheduleGroup

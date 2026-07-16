@@ -1,0 +1,38 @@
+[
+  {
+    "ParameterKey": "InstanceId",
+    "ParameterValue": "i-0123456789abcdef0"
+  },
+  {
+    "ParameterKey": "BasicAuthUsername",
+    "ParameterValue": "satisfactory"
+  },
+  {
+    "ParameterKey": "BasicAuthPassword",
+    "ParameterValue": "REPLACE_DURING_DEPLOYMENT"
+  },
+  {
+    "ParameterKey": "AutoStopHours",
+    "ParameterValue": "4"
+  },
+  {
+    "ParameterKey": "ExtendHours",
+    "ParameterValue": "2"
+  },
+  {
+    "ParameterKey": "CloudflareZoneId",
+    "ParameterValue": "YOUR_CLOUDFLARE_ZONE_ID"
+  },
+  {
+    "ParameterKey": "CloudflareRecordId",
+    "ParameterValue": "YOUR_DNS_RECORD_ID"
+  },
+  {
+    "ParameterKey": "CloudflareHostname",
+    "ParameterValue": "satisfactory.example.com"
+  },
+  {
+    "ParameterKey": "CloudflareTokenSecretArn",
+    "ParameterValue": "arn:aws:secretsmanager:us-west-2:123456789012:secret:satisfactory/cloudflare-token"
+  }
+]
