@@ -303,18 +303,6 @@ A value of `120` confirms the two-minute grace period.
 
 The server is currently configured for a maximum tick rate of 30. Tick rate represents the target number of server simulation updates per second; increasing it raises CPU demand and does not make factory production run faster.
 
-## Repository structure
-
-```text
-.
-├── README.md
-├── cloudformation-control-page.yaml
-├── control-page.png
-└── docker-compose.yml
-```
-
-The screenshot is referenced as `control-page.png` and should be stored in the repository root unless the image path in this README is changed.
-
 ## Skills demonstrated
 
 This project demonstrates practical experience with:
