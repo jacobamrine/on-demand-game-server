@@ -110,7 +110,6 @@ It provides:
 
 - Username and password login form
 - Secure, HTTP-only authentication cookie
-- CSRF protection for control actions
 - Current EC2 state
 - Current public IP and game port
 - Instance type display
@@ -131,7 +130,7 @@ When the Start button is pressed, the Lambda function:
 1. Reads the current EC2 state.
 2. Starts the instance if it is stopped.
 3. Calculates a shutdown deadline.
-4. tags the instance with the deadline.
+4. Tags the instance with the deadline.
 5. Creates a one-time EventBridge Scheduler task.
 6. Displays the updated state on the control page.
 
@@ -159,8 +158,6 @@ stop_grace_period: 2m
 
 This gives the server additional time to save and exit before Docker forcefully terminates the process.
 
-Players should still disconnect cleanly and create a manual save before ending an important session.
-
 ## Cost optimization
 
 The instance is billed for compute only while it is running. The EBS volume remains available while the instance is stopped, so the server installation and world persist between sessions.
@@ -171,7 +168,7 @@ This design is well suited to a group that plays for a few hours per week:
 Monthly cost
 ├── EC2 compute during active sessions
 ├── EBS storage while running or stopped
-├── Public IPv4 usage, if assigned
+├── Public IPv4 usage while assigned
 └── Minimal Lambda and EventBridge usage
 ```
 
