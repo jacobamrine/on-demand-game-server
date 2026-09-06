@@ -2,7 +2,7 @@
 
 A cost-conscious, on-demand dedicated server for **Satisfactory**, hosted on Amazon EC2 and managed through a lightweight authenticated web control panel.
 
-The project combines an EC2-hosted Docker game server with an AWS Lambda control page that allows authorized players to start, extend, or stop the server without needing access to the AWS console. A one-time Amazon EventBridge Scheduler task automatically stops the instance after a configurable amount of time, reducing the cost of leaving a game server running when nobody is using it.
+The project combines an EC2-hosted Docker game server with a password protected AWS Lambda control page that allows authorized players to start, extend, or stop the server without needing access to the AWS console. A one-time Amazon EventBridge Scheduler task automatically stops the instance after a configurable amount of time, reducing the cost of leaving a game server running when nobody is using it.
 
 ![Satisfactory server control page](control-page.png)
 
